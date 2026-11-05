@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>three.js webaudio - speech synthesis</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+		<meta property="og:title" content="three.js webaudio - speech synthesis">
+		<meta property="og:type" content="website">
+		<meta property="og:url" content="https://threejs.org/examples/webaudio_speech.html">
+		<meta property="og:image" content="https://threejs.org/examples/screenshots/webaudio_speech.jpg">
+		<link type="text/css" rel="stylesheet" href="main.css">
+		<style>
+			#subtitle {
+				position: absolute;
+				left: 50%;
+				bottom: clamp( 12px, 6vh, 48px );
+				transform: translateX( -50% );
+				width: min( 90vw, 760px );
+				text-align: center;
+				font-size: clamp( 11px, 2.4vw, 22px );
+				line-height: 1.5;
+				color: #8a93a6;
+				text-shadow: 0 1px 4px #000;
+				pointer-events: none;
+			}
+			#subtitle .spoken {
+				color: #ffffff;
+			}
+			#subtitle .current {
+				color: #ffd36b;
+			}
+			#warning {
+				position: absolute;
+				top: 64px;
+				width: 100%;
+				text-align: center;
+				color: #ff8080;
+			}
+		</style>
+	</head>
+	<body>
+
+		<div id="info">
+			<a href="https://threejs.org" target="_blank" rel="noopener noreferrer">three.js</a> webaudio - speech synthesis<br/>
+			uses the <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Speech_API" target="_blank" rel="noopener">Web Speech API</a>
+		</div>
+		<div id="warning"></div>
+		<div id="subtitle"></div>
+
+		<script type="importmap">
+			{
+				"imports": {
+					"three": "../build/three.module.js",
+					"three/addons/": "./jsm/"
+				}
+			}
+		</script>
+
+		<script type="module">
+
+			import * as THREE from 'three';
+
+			import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+			import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+			let camera, scene, renderer, controls, timer;
+			let orb, orbMaterial, wordRings;
+
+			const synth = window.speechSynthesis;
+			const subtitle = document.getElementById( 'subtitle' );
+
+			const params = {
+				text: 'Olá! Esta cena usa a síntese de voz do navegador. A esfera pulsa a cada palavra pronunciada, e a legenda acompanha a fala.',
+				voice: '',
+				rate: 1,
+				pitch: 1,
+				speak: speak,
+				stop: stop
+			};
+
+			// speech state
+
+			let words = []; // { text, start, end } character ranges inside params.text
+			let currentWord = - 1;
+			let energy = 0; // 0..1, decays every frame and is raised on each word
+			let speaking = false;
+			let boundaryEventsSeen = false;
+			let fallbackTimer = null;
+			let session = 0; // ignores events of cancelled utterances
+
+			init();
+
+			function init() {
+
+				camera = new THREE.PerspectiveCamera( 45, window.innerWidth / window.innerHeight, 0.1, 100 );
+				camera.position.set( 0, 0.4, 6 );
+
+				scene = new THREE.Scene();
+				scene.background = new THREE.Color( 0x0b0d14 );
+				scene.fog = new THREE.Fog( 0x0b0d14, 8, 20 );
+
+				timer = new THREE.Timer();
+				timer.connect( document );
+
+				// lights
+
+				scene.add( new THREE.HemisphereLight( 0x8899ff, 0x221100, 1.5 ) );
+
+				const light = new THREE.PointLight( 0xffd36b, 30, 0, 2 );
+				light.position.set( 2, 3, 4 );
+				scene.add( light );
+
+				// orb
+
+				const geometry = new THREE.IcosahedronGeometry( 1, 24 );
+				geometry.setAttribute( 'basePosition', geometry.attributes.position.clone() );
+
+				orbMaterial = new THREE.MeshStandardMaterial( {
+					color: 0x2a3b8f,
+					emissive: 0xffb02e,
+					emissiveIntensity: 0.1,
+					roughness: 0.35,
+					metalness: 0.2,
+					flatShading: false
+				} );
+
+				orb = new THREE.Mesh( geometry, orbMaterial );
+				scene.add( orb );
+
+				// rings emitted on each word
+
+				wordRings = [];
+
+				const ringGeometry = new THREE.TorusGeometry( 1.1, 0.012, 8, 128 );
+
+				for ( let i = 0; i < 12; i ++ ) {
+
+					const ringMaterial = new THREE.MeshBasicMaterial( { color: 0xffd36b, transparent: true, opacity: 0, depthWrite: false } );
+					const ring = new THREE.Mesh( ringGeometry, ringMaterial );
+					ring.userData.age = Infinity;
+					scene.add( ring );
+					wordRings.push( ring );
+
+				}
+
+				// floor grid
+
+				const grid = new THREE.PolarGridHelper( 6, 16, 12, 64, 0x222838, 0x161a24 );
+				grid.position.y = - 1.6;
+				scene.add( grid );
+
+				// renderer
+
+				renderer = new THREE.WebGLRenderer( { antialias: true } );
+				renderer.setPixelRatio( window.devicePixelRatio );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				renderer.setAnimationLoop( animate );
+				document.body.appendChild( renderer.domElement );
+
+				controls = new OrbitControls( camera, renderer.domElement );
+				controls.enableDamping = true;
+				controls.minDistance = 3;
+				controls.maxDistance = 12;
+
+				window.addEventListener( 'resize', onWindowResize );
+
+				renderSubtitle();
+				initGUI();
+
+			}
+
+			function initGUI() {
+
+				const gui = new GUI();
+
+				gui.add( params, 'text' ).name( 'text' ).onFinishChange( () => {
+
+					if ( ! speaking ) renderSubtitle();
+
+				} );
+
+				if ( synth === undefined ) {
+
+					document.getElementById( 'warning' ).textContent = 'This browser does not support the Web Speech API.';
+					return;
+
+				}
+
+				const voiceFolder = gui.addFolder( 'voice' );
+				let voiceController = voiceFolder.add( params, 'voice', [] );
+				voiceFolder.add( params, 'rate', 0.5, 2, 0.05 );
+				voiceFolder.add( params, 'pitch', 0, 2, 0.05 );
+
+				gui.add( params, 'speak' );
+				gui.add( params, 'stop' );
+
+				function populateVoices() {
+
+					const voices = synth.getVoices();
+
+					if ( voices.length === 0 ) return;
+
+					// prefer the language of the text (Portuguese), then the page language
+
+					const preferred = [ 'pt-BR', 'pt', navigator.language, navigator.language.split( '-' )[ 0 ] ];
+
+					const sorted = [ ...voices ].sort( ( a, b ) => rank( a ) - rank( b ) || a.name.localeCompare( b.name ) );
+
+					function rank( voice ) {
+
+						for ( let i = 0; i < preferred.length; i ++ ) {
+
+							if ( voice.lang.replace( '_', '-' ).toLowerCase().startsWith( preferred[ i ].toLowerCase() ) ) return i;
+
+						}
+
+						return preferred.length;
+
+					}
+
+					const options = {};
+
+					for ( const voice of sorted ) {
+
+						options[ `${ voice.name } (${ voice.lang })` ] = voice.voiceURI;
+
+					}
+
+					if ( ! Object.values( options ).includes( params.voice ) ) params.voice = sorted[ 0 ].voiceURI;
+
+					voiceController = voiceController.options( options );
+
+				}
+
+				populateVoices();
+				synth.addEventListener( 'voiceschanged', populateVoices );
+
+			}
+
+			function tokenize( text ) {
+
+				const result = [];
+				const regex = /\S+/g;
+				let match;
+
+				while ( ( match = regex.exec( text ) ) !== null ) {
+
+					result.push( { text: match[ 0 ], start: match.index, end: match.index + match[ 0 ].length } );
+
+				}
+
+				return result;
+
+			}
+
+			// browsers stop long utterances after a while, so speak sentence by sentence
+
+			function splitSentences( text ) {
+
+				const result = [];
+				const regex = /[^.!?;:\n]+[.!?;:\n]*/g;
+				let match;
+
+				while ( ( match = regex.exec( text ) ) !== null ) {
+
+					if ( match[ 0 ].trim() !== '' ) result.push( { text: match[ 0 ], offset: match.index } );
+
+				}
+
+				return result;
+
+			}
+
+			function speak() {
+
+				if ( synth === undefined ) return;
+
+				stop();
+
+				const id = ++ session;
+				boundaryEventsSeen = false;
+
+				const text = params.text;
+				words = tokenize( text );
+				currentWord = - 1;
+				renderSubtitle();
+
+				const voice = synth.getVoices().find( ( v ) => v.voiceURI === params.voice ) || null;
+				const sentences = splitSentences( text );
+
+				speaking = sentences.length > 0;
+
+				sentences.forEach( ( sentence, index ) => {
+
+					const utterance = new SpeechSynthesisUtterance( sentence.text );
+					utterance.voice = voice;
+					if ( voice ) utterance.lang = voice.lang;
+					utterance.rate = params.rate;
+					utterance.pitch = params.pitch;
+
+					utterance.addEventListener( 'start', () => {
+
+						if ( id === session ) onSentenceStart( sentence );
+
+					} );
+
+					utterance.addEventListener( 'boundary', ( event ) => {
+
+						if ( id !== session ) return;
+						if ( event.name !== undefined && event.name !== 'word' ) return;
+
+						boundaryEventsSeen = true;
+						onWord( sentence.offset + event.charIndex );
+
+					} );
+
+					if ( index === sentences.length - 1 ) {
+
+						const finish = () => {
+
+							if ( id === session ) onFinished();
+
+						};
+
+						utterance.addEventListener( 'end', finish );
+						utterance.addEventListener( 'error', finish );
+
+					}
+
+					synth.speak( utterance );
+
+				} );
+
+			}
+
+			function stop() {
+
+				session ++;
+				if ( synth !== undefined ) synth.cancel();
+				onFinished();
+
+			}
+
+			function onFinished() {
+
+				speaking = false;
+				clearInterval( fallbackTimer );
+				fallbackTimer = null;
+				currentWord = words.length > 0 ? words.length : - 1;
+				renderSubtitle();
+
+			}
+
+			// some voices (e.g. remote ones) do not emit boundary events;
+			// in that case the words are advanced with an estimated speaking rate
+
+			function onSentenceStart( sentence ) {
+
+				clearInterval( fallbackTimer );
+
+				const firstWord = words.findIndex( ( w ) => w.end > sentence.offset );
+				onWord( words[ firstWord ] ? words[ firstWord ].start : sentence.offset );
+
+				const millisecondsPerWord = 380 / params.rate;
+				const sentenceEnd = sentence.offset + sentence.text.length;
+
+				fallbackTimer = setInterval( () => {
+
+					if ( boundaryEventsSeen ) {
+
+						clearInterval( fallbackTimer );
+						return;
+
+					}
+
+					const next = words[ currentWord + 1 ];
+					if ( next && next.start < sentenceEnd ) onWord( next.start );
+
+				}, millisecondsPerWord );
+
+			}
+
+			function onWord( charIndex ) {
+
+				const index = words.findIndex( ( w ) => charIndex >= w.start && charIndex < w.end );
+
+				if ( index === - 1 || index === currentWord ) return;
+
+				currentWord = index;
+				energy = 1;
+
+				emitRing( words[ index ].text.length );
+				renderSubtitle();
+
+			}
+
+			function emitRing( length ) {
+
+				let ring = wordRings[ 0 ];
+
+				for ( const r of wordRings ) {
+
+					if ( r.userData.age > ring.userData.age ) ring = r;
+
+				}
+
+				ring.userData.age = 0;
+				ring.userData.strength = Math.min( 1, 0.4 + length / 10 );
+				ring.rotation.set( Math.PI / 2 + ( Math.random() - 0.5 ) * 0.6, ( Math.random() - 0.5 ) * 0.6, 0 );
+
+			}
+
+			function renderSubtitle() {
+
+				subtitle.textContent = '';
+
+				const text = params.text;
+				const list = speaking || currentWord >= 0 ? words : tokenize( text );
+
+				list.forEach( ( word, index ) => {
+
+					const span = document.createElement( 'span' );
+					span.textContent = word.text + ' ';
+
+					if ( index < currentWord ) span.className = 'spoken';
+					else if ( index === currentWord ) span.className = 'current';
+
+					subtitle.appendChild( span );
+
+				} );
+
+			}
+
+			function onWindowResize() {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+			function animate( timestamp ) {
+
+				timer.update( timestamp );
+
+				const delta = Math.min( timer.getDelta(), 0.1 );
+				const time = timer.getElapsed();
+
+				energy = Math.max( 0, energy - delta * 2.5 );
+
+				// displace the orb surface with a few travelling waves
+
+				const position = orb.geometry.attributes.position;
+				const base = orb.geometry.attributes.basePosition;
+				const amplitude = 0.02 + energy * 0.18 + ( speaking ? 0.02 : 0 );
+
+				for ( let i = 0; i < position.count; i ++ ) {
+
+					const x = base.getX( i ), y = base.getY( i ), z = base.getZ( i );
+
+					const wave =
+						Math.sin( x * 4 + time * 2.1 ) *
+						Math.sin( y * 5 + time * 1.7 ) *
+						Math.sin( z * 3 + time * 2.6 );
+
+					const scale = 1 + wave * amplitude;
+
+					position.setXYZ( i, x * scale, y * scale, z * scale );
+
+				}
+
+				position.needsUpdate = true;
+				orb.geometry.computeVertexNormals();
+
+				orb.rotation.y += delta * 0.2;
+				orbMaterial.emissiveIntensity = 0.1 + energy * 0.6;
+
+				// rings
+
+				for ( const ring of wordRings ) {
+
+					ring.userData.age += delta;
+
+					const t = ring.userData.age / 1.4;
+
+					if ( t >= 1 ) {
+
+						ring.visible = false;
+						continue;
+
+					}
+
+					ring.visible = true;
+					ring.scale.setScalar( 1 + t * 2.5 );
+					ring.material.opacity = ( 1 - t ) * ring.userData.strength;
+
+				}
+
+				controls.update();
+
+				renderer.render( scene, camera );
+
+			}
+
+		</script>
+
+	</body>
+</html>
