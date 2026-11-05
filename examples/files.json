@@ -549,6 +549,7 @@
 	"webaudio": [
 		"webaudio_orientation",
 		"webaudio_sandbox",
+		"webaudio_speech",
 		"webaudio_timing",
 		"webaudio_visualizer"
 	],
